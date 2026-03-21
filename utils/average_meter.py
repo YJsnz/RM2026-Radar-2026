@@ -1,10 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Average Meter utility for RM2025 Radar Algorithm System
-Copyright (c) 2025 香港科技大学ENTERPRIZE战队（HKUST ENTERPRIZE Team）
-
-Licensed under the MIT License. See LICENSE file in the project root for license information.
-"""
 
 
 class AverageMeter:

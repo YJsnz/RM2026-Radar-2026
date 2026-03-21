@@ -69,7 +69,7 @@ class MainEventLoop:
             raise ValueError(f"Unknown tracker type: {self.config['tracker']['type']}")
         
         # warm up
-        self.tracker.warmup(warmup_num=20)
+        self.tracker.warmup(warmup_num=10)
         
         self.__class__._instance = self
 

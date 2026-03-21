@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-Hikvision Camera Driver for RM2025 Radar Algorithm System
-Copyright (c) 2025 香港科技大学ENTERPRIZE战队（HKUST ENTERPRIZE Team）
 
-Licensed under the MIT License. See LICENSE file in the project root for license information.
-"""
 import os
 import sys
 
@@ -40,17 +35,23 @@ tz = timezone(timedelta(hours=8))
 import threading, queue
 import concurrent
 
-# 定义常用的Bayer格式映射（扩展包含数值17301513的兼容）
+# 修正格式映射：17301513实际对应BayerBG8（解决RB反转）
+# 新增通道交换选项，方便快速调整
 BAYER_FORMAT_MAP = {
     # 标准海康SDK格式码
-    PixelType_Gvsp_BayerGB8: ("BayerGB8", cv2.COLOR_BAYER_GB2RGB),
-    PixelType_Gvsp_BayerGR8: ("BayerGR8", cv2.COLOR_BAYER_GR2RGB),
-    PixelType_Gvsp_BayerRG8: ("BayerRG8", cv2.COLOR_BAYER_RG2RGB),
-    PixelType_Gvsp_BayerBG8: ("BayerBG8", cv2.COLOR_BAYER_BG2RGB),
-    PixelType_Gvsp_Mono8: ("Mono8", None),
-    # 兼容你日志中出现的格式码17301513
-    17301513: ("BayerRG8", cv2.COLOR_BAYER_RG2RGB),  # 实测这个格式码对应BayerRG8
+    PixelType_Gvsp_BayerGB8: ("BayerGB8", cv2.COLOR_BAYER_GB2RGB, False),
+    PixelType_Gvsp_BayerGR8: ("BayerGR8", cv2.COLOR_BAYER_GR2RGB, False),
+    PixelType_Gvsp_BayerRG8: ("BayerRG8", cv2.COLOR_BAYER_RG2RGB, False),
+    PixelType_Gvsp_BayerBG8: ("BayerBG8", cv2.COLOR_BAYER_BG2RGB, False),
+    PixelType_Gvsp_Mono8: ("Mono8", None, False),
+    # 修正：17301513对应BayerBG8（解决RB反转）
+    17301513: ("BayerBG8", cv2.COLOR_BAYER_BG2RGB, False),  
+    # 备用：如果仍有反转，启用通道交换（设置为True）
+    # 17301513: ("BayerBG8", cv2.COLOR_BAYER_BG2RGB, True),  
 }
+
+# 全局通道交换开关（快速调试用）
+SWAP_RB_CHANNEL = False
 
 class HikState(Enum):
     DISABLED = 0
@@ -147,9 +148,10 @@ class SimpleHikCamera(Node):
         self.gain = args.gain
         self._init_buffer()
         
-        # 新增：存储相机实际的像素格式和对应的转换代码
+        # 新增：存储格式转换的通道交换标记
         self.actual_pixel_format = None
         self.bayer_conversion_code = None
+        self.swap_rb = False
         
         self.recording_workers_num = args.recording_workers_num
         self.recording_save_root_dir = args.recording_save_root_dir
@@ -280,26 +282,29 @@ class SimpleHikCamera(Node):
             )
             return 1
 
-        # 获取相机当前的像素格式（兼容你日志中的17301513格式码）
+        # 获取相机当前的像素格式
         self.actual_pixel_format = self._get_enum_value("PixelFormat")
         self.get_logger().info(f"Camera current pixel format code: {self.actual_pixel_format}")
         
-        # 匹配格式转换代码
+        # 匹配格式转换代码和通道交换标记
         if self.actual_pixel_format in BAYER_FORMAT_MAP:
-            format_name, conversion_code = BAYER_FORMAT_MAP[self.actual_pixel_format]
+            format_name, conversion_code, swap_rb = BAYER_FORMAT_MAP[self.actual_pixel_format]
             self.bayer_conversion_code = conversion_code
-            self.get_logger().info(f"Using pixel format: {format_name}, conversion code: {conversion_code}")
+            self.swap_rb = swap_rb
+            self.get_logger().info(
+                f"Using pixel format: {format_name}, conversion code: {conversion_code}, swap RB: {self.swap_rb}"
+            )
             
-            # 如果不是BayerGB8，给出警告但不返回错误
-            if self.actual_pixel_format != PixelType_Gvsp_BayerGB8:
-                self.get_logger().warning(
-                    f"Pixel format {format_name} does not match expected BayerGB8, but will continue using it"
-                )
+            # 兼容全局通道交换开关
+            if SWAP_RB_CHANNEL:
+                self.swap_rb = True
+                self.get_logger().warning("Global SWAP_RB_CHANNEL enabled, will swap red and blue channels")
         else:
-            # 尝试常用格式的降级适配
-            self.get_logger().warning(f"Unrecognized pixel format: {self.actual_pixel_format}, trying BayerRG8 fallback")
-            self.bayer_conversion_code = cv2.COLOR_BAYER_RG2RGB
-            self.get_logger().info("Fallback to BayerRG8 conversion (cv2.COLOR_BAYER_RG2RGB)")
+            # 降级适配为BayerBG8（解决RB反转）
+            self.get_logger().warning(f"Unrecognized pixel format: {self.actual_pixel_format}, fallback to BayerBG8")
+            self.bayer_conversion_code = cv2.COLOR_BAYER_BG2RGB
+            self.swap_rb = False
+            self.get_logger().info("Fallback to BayerBG8 conversion (cv2.COLOR_BAYER_BG2RGB)")
 
         return 0
 
@@ -332,6 +337,17 @@ class SimpleHikCamera(Node):
             self.get_logger().info(f"Gain set to {gain}")
         self.gain = gain
         return True
+    
+    def _swap_rb_channels(self, rgb_image):
+        """交换RGB图像的红蓝光道（解决RB反转）"""
+        # 方法1：直接交换通道
+        # rgb_image[:, :, [0, 2]] = rgb_image[:, :, [2, 0]]
+        
+        # 方法2：更安全的交换（不修改原数组）
+        swapped = np.copy(rgb_image)
+        swapped[:, :, 0] = rgb_image[:, :, 2]
+        swapped[:, :, 2] = rgb_image[:, :, 0]
+        return swapped
     
     def _get_formatted_time(self):
         return datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
@@ -517,16 +533,23 @@ class SimpleHikCamera(Node):
                     dtype=np.uint8,
                 ).reshape(self.height, self.width)
 
-                # 修改：使用适配的转换代码，增加容错
-                if self.bayer_conversion_code is not None:
-                    try:
+                # 核心修改：格式转换 + 可选的RB通道交换
+                try:
+                    if self.bayer_conversion_code is not None:
                         rgb = cv2.cvtColor(np_data_buf, self.bayer_conversion_code)
-                    except Exception as e:
-                        self.get_logger().error(f"Format conversion failed: {e}, using fallback")
-                        rgb = cv2.cvtColor(np_data_buf, cv2.COLOR_BAYER_RG2RGB)
-                else:
-                    # 单色格式转换为RGB
-                    rgb = cv2.cvtColor(np_data_buf, cv2.COLOR_GRAY2RGB)
+                        
+                        # 如果需要交换RB通道（解决反转问题）
+                        if self.swap_rb:
+                            rgb = self._swap_rb_channels(rgb)
+                    else:
+                        # 单色格式转换为RGB
+                        rgb = cv2.cvtColor(np_data_buf, cv2.COLOR_GRAY2RGB)
+                except Exception as e:
+                    self.get_logger().error(f"Format conversion failed: {e}, using fallback")
+                    # 降级使用BayerBG8转换（解决RB反转）
+                    rgb = cv2.cvtColor(np_data_buf, cv2.COLOR_BAYER_BG2RGB)
+                    # 可选：强制交换通道
+                    # rgb = self._swap_rb_channels(rgb)
                     
                 self.ring_buffer.put(rgb, time_stamp)
 
@@ -629,10 +652,10 @@ if __name__ == "__main__":
                     img_rgb, dsize=(1280, 840), interpolation=cv2.INTER_LINEAR
                 )
                 display_bgr = cv2.cvtColor(display_bgr, code=cv2.COLOR_RGB2BGR)
-                # 可选：显示图像（取消注释即可）
-                # cv2.imshow("Camera View", display_bgr)
-                # if cv2.waitKey(1) & 0xFF == ord('q'):
-                #     break
+                # 显示图像（方便调试通道问题）
+                cv2.imshow("Camera View", display_bgr)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
 
     except KeyboardInterrupt:
         print("Stream stopped by user")

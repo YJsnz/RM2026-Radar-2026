@@ -68,19 +68,6 @@ referee:
   baudrate: 115200            ## 串口波特率
 
 debug:
-  inference_video: false                   # 是否启用视频推理
-  video_source: 1  # 视频源路径，可以是摄像头(0)、视频文件或图片文件
+  inference_video: true             # 是否启用视频推理
+  video_source: "1.mp4"  # 视频源路径，可以是摄像头(0)、视频文件或图片文件
   streaming_video: false                  # 是否录制视频
-
-
-  
-
-
-
-
-
-
-
-
-
-

@@ -28,7 +28,7 @@ class RadarStationMainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RoboMaster 2025 雷达站控制界面")
+        self.setWindowTitle("RoboMaster 2026 雷达站控制界面")
         self.setGeometry(100, 100, 2048, 1534)
 
         # 初始化UI组件
@@ -88,7 +88,7 @@ class RadarStationMainWindow(QMainWindow):
 
         # 相机图像显示
         
-        self.target_camera_size = QSize(819, 700)  # 2/5 of 2048px width
+        self.target_camera_size = QSize(819, 700)  # 调整为更匀称的大小
         self.target_tracker_size = QSize(819, 700)
         
         self.camera_label = QLabel("相机图像")
