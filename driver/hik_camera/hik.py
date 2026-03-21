@@ -38,16 +38,19 @@ import concurrent
 # 修正格式映射：17301513实际对应BayerBG8（解决RB反转）
 # 新增通道交换选项，方便快速调整
 BAYER_FORMAT_MAP = {
-    # 标准海康SDK格式码
+    # 标准海康SDK Bayer / Mono 格式码
     PixelType_Gvsp_BayerGB8: ("BayerGB8", cv2.COLOR_BAYER_GB2RGB, False),
     PixelType_Gvsp_BayerGR8: ("BayerGR8", cv2.COLOR_BAYER_GR2RGB, False),
     PixelType_Gvsp_BayerRG8: ("BayerRG8", cv2.COLOR_BAYER_RG2RGB, False),
     PixelType_Gvsp_BayerBG8: ("BayerBG8", cv2.COLOR_BAYER_BG2RGB, False),
     PixelType_Gvsp_Mono8: ("Mono8", None, False),
     # 修正：17301513对应BayerBG8（解决RB反转）
-    17301513: ("BayerBG8", cv2.COLOR_BAYER_BG2RGB, False),  
+    17301513: ("BayerBG8", cv2.COLOR_BAYER_BG2RGB, False),
+    # 在 laserDrone 工程中使用的 BGR8 打包格式（pixel_format: 35127317）
+    # 这里标记为 BGR8，后续在流线程中单独处理为三通道图像
+    35127317: ("BGR8", None, False),
     # 备用：如果仍有反转，启用通道交换（设置为True）
-    # 17301513: ("BayerBG8", cv2.COLOR_BAYER_BG2RGB, True),  
+    # 17301513: ("BayerBG8", cv2.COLOR_BAYER_BG2RGB, True),
 }
 
 # 全局通道交换开关（快速调试用）
@@ -284,8 +287,10 @@ class SimpleHikCamera(Node):
 
         # 获取相机当前的像素格式
         self.actual_pixel_format = self._get_enum_value("PixelFormat")
-        self.get_logger().info(f"Camera current pixel format code: {self.actual_pixel_format}")
-        
+        self.get_logger().info(
+            f"Camera current pixel format code: {self.actual_pixel_format}"
+        )
+
         # 匹配格式转换代码和通道交换标记
         if self.actual_pixel_format in BAYER_FORMAT_MAP:
             format_name, conversion_code, swap_rb = BAYER_FORMAT_MAP[self.actual_pixel_format]
@@ -301,10 +306,26 @@ class SimpleHikCamera(Node):
                 self.get_logger().warning("Global SWAP_RB_CHANNEL enabled, will swap red and blue channels")
         else:
             # 降级适配为BayerBG8（解决RB反转）
-            self.get_logger().warning(f"Unrecognized pixel format: {self.actual_pixel_format}, fallback to BayerBG8")
+            self.get_logger().warning(
+                f"Unrecognized pixel format: {self.actual_pixel_format}, fallback to BayerBG8"
+            )
             self.bayer_conversion_code = cv2.COLOR_BAYER_BG2RGB
             self.swap_rb = False
-            self.get_logger().info("Fallback to BayerBG8 conversion (cv2.COLOR_BAYER_BG2RGB)")
+            self.get_logger().info(
+                "Fallback to BayerBG8 conversion (cv2.COLOR_BAYER_BG2RGB)"
+            )
+
+        # 根据实际 PayloadSize 重新分配取流缓冲，避免像素格式为 BGR8 等时缓冲区过小
+        try:
+            payload_size = self._get_int_value("PayloadSize")
+            if payload_size > 0:
+                self.nPayloadSize = payload_size
+                self.data_buf = (ctypes.c_ubyte * self.nPayloadSize)()
+                self.get_logger().info(
+                    f"Reset payload buffer using PayloadSize={self.nPayloadSize}"
+                )
+        except Exception as e:
+            self.get_logger().warning(f"Failed to reset payload buffer: {e}")
 
         return 0
 
@@ -528,26 +549,36 @@ class SimpleHikCamera(Node):
                     self.error_counter = 0
                 time_stamp = self.get_clock().now().nanoseconds / 1e9
                 recorded_time_stamp = self._get_formatted_time()
-                np_data_buf = np.frombuffer(
+                flat = np.frombuffer(
                     self.data_buf,
                     dtype=np.uint8,
-                ).reshape(self.height, self.width)
+                )
 
                 # 核心修改：格式转换 + 可选的RB通道交换
                 try:
-                    if self.bayer_conversion_code is not None:
-                        rgb = cv2.cvtColor(np_data_buf, self.bayer_conversion_code)
-                        
-                        # 如果需要交换RB通道（解决反转问题）
-                        if self.swap_rb:
-                            rgb = self._swap_rb_channels(rgb)
+                    if self.actual_pixel_format == 35127317:
+                        # BGR8 打包格式：缓冲为 H x W x 3，先视为 BGR 再转为 RGB
+                        np_data_buf = flat.reshape(self.height, self.width, 3)
+                        bgr = np_data_buf
+                        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                     else:
-                        # 单色格式转换为RGB
-                        rgb = cv2.cvtColor(np_data_buf, cv2.COLOR_GRAY2RGB)
+                        np_data_buf = flat.reshape(self.height, self.width)
+                        if self.bayer_conversion_code is not None:
+                            rgb = cv2.cvtColor(np_data_buf, self.bayer_conversion_code)
+
+                            # 如果需要交换RB通道（解决反转问题）
+                            if self.swap_rb:
+                                rgb = self._swap_rb_channels(rgb)
+                        else:
+                            # 单色格式转换为RGB
+                            rgb = cv2.cvtColor(np_data_buf, cv2.COLOR_GRAY2RGB)
                 except Exception as e:
                     self.get_logger().error(f"Format conversion failed: {e}, using fallback")
                     # 降级使用BayerBG8转换（解决RB反转）
-                    rgb = cv2.cvtColor(np_data_buf, cv2.COLOR_BAYER_BG2RGB)
+                    rgb = cv2.cvtColor(
+                        flat.reshape(self.height, self.width),
+                        cv2.COLOR_BAYER_BG2RGB,
+                    )
                     # 可选：强制交换通道
                     # rgb = self._swap_rb_channels(rgb)
                     

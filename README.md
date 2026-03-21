@@ -1,10 +1,16 @@
 # RM2026 Radar YSU System
+
+## 项目概述
+
+RM2026 Radar YSU System是一个基于计算机视觉和深度学习的雷达系统，用于RoboMaster比赛中的目标检测、跟踪和定位。该系统使用多种深度学习模型实现实时目标检测和跟踪，并通过相机标定和几何变换将检测结果投影到场地坐标系中。
+
 ## 环境要求
 
 ### 硬件要求
 - NVIDIA GPU（支持CUDA 11.8）
-- 海康相机
+- 海康相机（或其他兼容相机）
 - 串口设备（用于裁判系统通信）
+- 足够的存储空间（至少5GB）
 
 ### 软件要求
 - Ubuntu 22.04 LTS
@@ -18,7 +24,7 @@
 ### 1. 克隆项目
 ```bash
 git clone <repository-url>
-cd RM2025-Radar-Algorithm-main
+cd RM2026-Radar
 ```
 
 ### 2. 创建虚拟环境
@@ -49,6 +55,45 @@ sudo apt update
 sudo apt install -y ros-humble-ros-base ros-humble-rclpy
 ```
 
+## 配置说明
+
+### 主要配置文件
+- `config/params.yaml`：系统核心参数配置
+- `config/device.yaml`：设备配置
+- `config/botsort.yaml`：BotSort跟踪器配置
+- `config/bytetrack.yaml`：ByteTrack跟踪器配置
+- `config/guess_pts.yaml`：点预测配置
+
+### 关键配置参数
+
+#### 1. 视频推理配置
+```yaml
+debug:
+  inference_video: true  # 是否启用视频推理
+  video_source: "p1.mp4"  # 视频源路径
+  streaming_video: false  # 是否录制视频
+```
+
+#### 2. 模型配置
+```yaml
+car_detector:
+  img_size: 1280  # 车辆检测器输入尺寸
+  conf_thres: 0.5  # 置信度阈值
+  iou_thres: 0.5  # IOU阈值
+  max_det: 10  # 最大检测数量
+
+armor_detector:
+  img_size: 192  # 装甲板检测器输入尺寸
+  conf_thres: 0.25  # 置信度阈值
+  iou_thres: 0.4  # IOU阈值
+  max_det: 1  # 最大检测数量
+```
+
+#### 3. 设备配置
+```yaml
+device: "cuda"  # 运行设备（cuda或cpu）
+```
+
 ## 运行方法
 
 ### 启动项目
@@ -60,17 +105,26 @@ conda activate rm2026-radar
 bash start.sh
 ```
 
-### 配置文件
-- `config/params.yaml`：系统参数配置
-- `config/device.yaml`：设备配置
+### 视频推理模式
+1. 修改`config/params.yaml`中的`video_source`为视频文件路径
+2. 设置`inference_video: true`
+3. 运行启动脚本
+
+### 相机实时模式
+1. 修改`config/params.yaml`中的`inference_video: false`
+2. 确保海康相机已连接
+3. 运行启动脚本
 
 ## 项目结构
 
 ```
-RM2025-Radar-Algorithm-main/
+RM2026-Radar/
 ├── config/                # 配置文件目录
 │   ├── params.yaml        # 系统参数配置
-│   └── device.yaml        # 设备配置
+│   ├── device.yaml        # 设备配置
+│   ├── botsort.yaml       # BotSort跟踪器配置
+│   ├── bytetrack.yaml     # ByteTrack跟踪器配置
+│   └── guess_pts.yaml     # 点预测配置
 ├── driver/                # 驱动目录
 │   ├── hik_camera/        # 海康相机驱动
 │   │   ├── MvImport/      # 海康相机SDK Python接口
@@ -78,28 +132,123 @@ RM2025-Radar-Algorithm-main/
 │   │   └── mock_hik.py    # 模拟相机实现
 │   └── referee/           # 裁判系统驱动
 │       ├── referee_comm.py # 裁判系统通信
-│       └── serial_comm.py  # 串口通信
+│       ├── serial_comm.py  # 串口通信
+│       └── usb.py          # USB设备管理
 ├── interface/             # 界面目录
 │   ├── core.py            # 核心界面实现
 │   └── interfactive_display.py # 交互式显示组件
 ├── model/                 # 模型目录
-│   └── pfa_yolov5/        # YOLOv5模型实现
+│   ├── pfa_yolov5/        # YOLOv5模型实现
+│   ├── yolov8/            # YOLOv8模型实现
+│   ├── yolov12/           # YOLOv12模型实现
+│   ├── armor_detector.py  # 装甲板检测器
+│   └── armor_light_classifier.py # 装甲板灯分类器
+├── tracker/               # 跟踪器目录
+│   └── CascadeMatchTracker/ # 级联匹配跟踪器
+├── transform/             # 坐标转换目录
+│   ├── ray_renderer.py    # 射线渲染
+│   └── solidwork2uwb.py   # SolidWork到UWB坐标转换
 ├── utils/                 # 工具目录
-│   └── config.py          # 配置工具
+│   ├── config.py          # 配置工具
+│   └── average_meter.py   # 平均计数器
 ├── field/                 # 场地相关文件
 ├── demo/                  # 演示数据
+├── run_scripts/           # 运行脚本
 ├── start.sh               # 启动脚本
-└── main.py                # 主入口文件
+├── main.py                # 主入口文件
+└── main_event_loop.py     # 主事件循环
 ```
 
 ## 核心功能
 
-1. **目标检测**：使用YOLOv5模型进行实时目标检测
-2. **目标跟踪**：基于检测结果进行目标跟踪
-3. **场地定位**：将检测到的目标投影到场地坐标系
-4. **裁判系统通信**：与裁判系统进行实时通信
-5. **相机控制**：支持相机参数调整和图像获取
-6. **可视化界面**：实时显示检测结果和场地投影
+### 1. 目标检测
+- **车辆检测**：使用YOLOv8模型检测场上车辆
+- **装甲板检测**：使用YOLOv8模型检测车辆装甲板
+- **数字分类**：使用分类模型识别装甲板上的数字
+
+### 2. 目标跟踪
+- **级联匹配跟踪**：基于检测结果和历史轨迹进行目标跟踪
+- **Kalman滤波**：使用Kalman滤波器预测目标位置
+- **Bot ID关联**：为每个检测到的目标分配唯一ID
+
+### 3. 场地定位
+- **相机标定**：使用相机内参和外参进行坐标转换
+- **射线投影**：将像素坐标转换为场地坐标系
+- **UWB坐标转换**：将场地坐标转换为UWB坐标系
+
+### 4. 裁判系统通信
+- **串口通信**：与裁判系统进行实时通信
+- **数据打包**：将检测结果打包为裁判系统格式
+- **状态上报**：实时上报目标状态
+
+### 5. 可视化界面
+- **实时显示**：显示检测结果和跟踪状态
+- **场地投影**：在场地模型上显示目标位置
+- **性能监控**：显示帧率和系统状态
+
+## 模型说明
+
+### 1. 车辆检测器
+- **模型**：YOLOv8 ONNX
+- **输入尺寸**：1280x1280
+- **输出**：车辆边界框和置信度
+
+### 2. 装甲板检测器
+- **模型**：YOLOv8 ONNX
+- **输入尺寸**：192x192
+- **输出**：装甲板边界框和置信度
+
+### 3. 数字分类器
+- **模型**：YOLOv8 ONNX分类模型
+- **输入尺寸**：64x64
+- **输出**：数字类别和置信度
+
+## 性能优化
+
+### 1. GPU加速
+- 使用CUDA进行模型推理
+- 批量处理提高吞吐量
+- 模型量化减少内存使用
+
+### 2. 代码优化
+- 多线程处理
+- 内存管理优化
+- 计算缓存
+
+### 3. 配置优化
+- 调整模型输入尺寸
+- 优化置信度阈值
+- 合理设置最大检测数量
+
+## 常见问题和解决方案
+
+### 1. 串口连接失败
+- **原因**：串口设备未连接或权限不足
+- **解决方案**：
+  - 检查串口设备连接
+  - 确保用户有访问串口的权限
+  - 修改`config/params.yaml`中的串口配置
+
+### 2. 相机无法获取图像
+- **原因**：相机未连接或SDK未正确安装
+- **解决方案**：
+  - 检查相机连接
+  - 确认海康SDK已正确安装
+  - 尝试重新启动相机
+
+### 3. 推理帧率低
+- **原因**：模型输入尺寸过大或硬件性能不足
+- **解决方案**：
+  - 降低模型输入尺寸
+  - 优化代码性能
+  - 考虑使用更强大的GPU
+
+### 4. CUDA相关错误
+- **原因**：CUDA版本不匹配或驱动未正确安装
+- **解决方案**：
+  - 确保CUDA 11.8和cuDNN 9.1.0正确安装
+  - 检查GPU驱动是否最新
+  - 验证CUDA环境变量配置
 
 ## 注意事项
 
@@ -107,195 +256,36 @@ RM2025-Radar-Algorithm-main/
 2. **CUDA环境**：确保CUDA 11.8和cuDNN 9.1.0正确安装
 3. **串口设备**：确保裁判系统串口设备正确连接
 4. **海康相机**：确保海康相机SDK正确安装并连接相机
+5. **模型文件**：确保模型文件存在于正确路径
+6. **视频文件**：确保视频文件格式兼容且路径正确
 
 ## 依赖包版本
 
-以下是虚拟环境中安装的所有依赖包及其版本：
+以下是虚拟环境中安装的主要依赖包及其版本：
 
-| 包名 | 版本 |
-|------|------|
-| addict | 2.4.0 |
-| annotated-types | 0.7.0 |
-| apturl | 0.5.2 |
-| argcomplete | 1.8.1 |
-| asttokens | 3.0.1 |
-| attrs | 25.4.0 |
-| beautifulsoup4 | 4.10.0 |
-| blinker | 1.9.0 |
-| Brlapi | 0.8.3 |
-| catkin-pkg-modules | 1.1.0 |
-| certifi | 2020.6.20 |
-| chardet | 4.0.0 |
-| click | 8.3.1 |
-| colorama | 0.4.4 |
-| coloredlogs | 15.0.1 |
-| comm | 0.2.3 |
-| command-not-found | 0.3 |
-| ConfigArgParse | 1.7.5 |
-| contourpy | 1.3.2 |
-| cryptography | 3.4.8 |
-| cupshelpers | 1.0 |
-| cycler | 0.12.1 |
-| dash | 4.0.0 |
-| dbus-python | 1.2.18 |
-| decorator | 5.2.1 |
-| defer | 1.0.6 |
-| distro | 1.7.0 |
-| distro-info | 1.1+ubuntu0.2 |
-| docutils | 0.17.1 |
-| empy | 3.3.4 |
-| exceptiongroup | 1.3.1 |
-| executing | 2.2.1 |
-| fastjsonschema | 2.21.2 |
-| filelock | 3.20.0 |
-| filterpy | 1.4.5 |
-| flake8 | 4.0.1 |
-| Flask | 3.1.3 |
-| flatbuffers | 25.12.19 |
-| fonttools | 4.62.0 |
-| fsspec | 2025.12.0 |
-| html5lib | 1.1 |
-| httplib2 | 0.20.2 |
-| humanfriendly | 10.0 |
-| idna | 3.3 |
-| importlib-metadata | 4.6.4 |
-| iniconfig | 1.1.1 |
-| ipython | 8.38.0 |
-| ipywidgets | 8.1.8 |
-| itsdangerous | 2.2.0 |
-| jedi | 0.19.2 |
-| jeepney | 0.7.1 |
-| Jinja2 | 3.1.6 |
-| joblib | 1.5.3 |
-| jsonschema | 4.26.0 |
-| jsonschema-specifications | 2025.9.1 |
-| jupyter_core | 5.9.1 |
-| jupyterlab_widgets | 3.0.16 |
-| keyring | 23.5.0 |
-| kiwisolver | 1.5.0 |
-| language-selector | 0.1 |
-| lark | 1.1.1 |
-| launchpadlib | 1.10.16 |
-| lazr.restfulclient | 0.14.4 |
-| lazr.uri | 1.0.6 |
-| louis | 3.20.0 |
-| lxml | 4.8.0 |
-| macaroonbakery | 1.3.1 |
-| MarkupSafe | 3.0.2 |
-| matplotlib | 3.10.8 |
-| matplotlib-inline | 0.2.1 |
-| mccabe | 0.6.1 |
-| more-itertools | 8.10.0 |
-| mpmath | 1.3.0 |
-| narwhals | 2.18.0 |
-| nbformat | 5.10.4 |
-| nest-asyncio | 1.6.0 |
-| netifaces | 0.11.0 |
-| networkx | 3.4.2 |
-| numpy | 1.26.4 |
-| nvidia-cublas-cu11 | 11.11.3.6 |
-| nvidia-cuda-cupti-cu11 | 11.8.87 |
-| nvidia-cuda-nvrtc-cu11 | 11.8.89 |
-| nvidia-cuda-runtime-cu11 | 11.8.89 |
-| nvidia-cudnn-cu11 | 9.1.0.70 |
-| nvidia-cufft-cu11 | 10.9.0.58 |
-| nvidia-curand-cu11 | 10.3.0.86 |
-| nvidia-cusolver-cu11 | 11.4.1.48 |
-| nvidia-cusparse-cu11 | 11.7.5.86 |
-| nvidia-nccl-cu11 | 2.21.5 |
-| nvidia-nvtx-cu11 | 11.8.86 |
-| oauthlib | 3.2.0 |
-| olefile | 0.46 |
-| onnxruntime-gpu | 1.23.2 |
-| open3d | 0.19.0 |
-| opencv-python | 4.8.0.76 |
-| packaging | 21.3 |
-| pandas | 2.3.3 |
-| parso | 0.8.6 |
-| pexpect | 4.8.0 |
-| pillow | 12.1.1 |
-| pip | 22.0.2 |
-| platformdirs | 4.9.4 |
-| plotly | 6.6.0 |
-| pluggy | 0.13.0 |
-| polars | 1.39.0 |
-| polars-runtime-32 | 1.39.0 |
-| prompt_toolkit | 3.0.52 |
-| protobuf | 3.12.4 |
-| psutil | 7.2.2 |
-| ptyprocess | 0.7.0 |
-| pure_eval | 0.2.3 |
-| py | 1.10.0 |
-| pycairo | 1.20.1 |
-| pycodestyle | 2.8.0 |
-| pycups | 2.0.1 |
-| pydantic | 2.12.5 |
-| pydantic_core | 2.41.5 |
-| pydocstyle | 6.1.1 |
-| pyflakes | 2.4.0 |
-| Pygments | 2.11.2 |
-| PyGObject | 3.42.1 |
-| PyJWT | 2.3.0 |
-| pymacaroons | 0.13.0 |
-| PyNaCl | 1.5.0 |
-| pyparsing | 3.3.2 |
-| PyQt5 | 5.15.11 |
-| PyQt5-Qt5 | 5.15.18 |
-| PyQt5_sip | 12.18.0 |
-| pyquaternion | 0.9.9 |
-| pyRFC3339 | 1.1 |
-| pyserial | 3.5 |
-| pytest | 6.2.5 |
-| python-apt | 2.4.0+ubuntu4.1 |
-| python-dateutil | 2.9.0.post0 |
-| python-debian | 0.1.43+ubuntu1.1 |
-| pytz | 2022.1 |
-| pyxdg | 0.27 |
-| PyYAML | 5.4.1 |
-| referencing | 0.37.0 |
-| reportlab | 3.6.8 |
-| requests | 2.25.1 |
-| retrying | 1.4.2 |
-| roman | 3.3 |
-| rosdistro-modules | 1.0.1 |
-| rospkg-modules | 1.6.1 |
-| rpds-py | 0.30.0 |
-| scikit-learn | 1.7.2 |
-| scipy | 1.15.3 |
-| screen-resolution-extra | 0.0.0 |
-| seaborn | 0.13.2 |
-| SecretStorage | 3.3.1 |
-| setuptools | 59.6.0 |
-| six | 1.16.0 |
-| snowballstemmer | 2.2.0 |
-| soupsieve | 2.3.1 |
-| stack-data | 0.6.3 |
-| sympy | 1.14.0 |
-| systemd-python | 234 |
-| threadpoolctl | 3.6.0 |
-| toml | 0.10.2 |
-| torch | 2.7.1+cu118 |
-| torchaudio | 2.7.1+cu118 |
-| torchvision | 0.22.1+cu118 |
-| tqdm | 4.67.3 |
-| traitlets | 5.14.3 |
-| triton | 3.3.1 |
-| typing_extensions | 4.15.0 |
-| typing-inspection | 0.4.2 |
-| tzdata | 2025.3 |
-| ubuntu-drivers-common | 0.0.0 |
-| ubuntu-pro-client | 8001 |
-| ufw | 0.36.1 |
-| ultralytics | 8.4.21 |
-| ultralytics-thop | 2.0.18 |
-| unattended-upgrades | 0.1 |
-| urllib3 | 1.26.5 |
-| wadllib | 1.3.6 |
-| wcwidth | 0.6.0 |
-| webencodings | 0.5.1 |
-| Werkzeug | 3.1.6 |
-| wheel | 0.37.1 |
-| widgetsnbextension | 4.0.15 |
-| xdg | 5 |
-| xkit | 0.0.0 |
-| zipp | 1.0.0 |
+| 包名 | 版本 | 用途 |
+|------|------|------|
+| torch | 2.7.1+cu118 | 深度学习框架 |
+| torchvision | 0.22.1+cu118 | 计算机视觉库 |
+| opencv-python | 4.8.0.76 | 图像处理 |
+| onnxruntime-gpu | 1.23.2 | ONNX模型推理 |
+| ultralytics | 8.4.21 | YOLO模型实现 |
+| open3d | 0.19.0 | 3D点云处理 |
+| filterpy | 1.4.5 | 滤波算法 |
+| pyserial | 3.5 | 串口通信 |
+| PyQt5 | 5.15.11 | GUI界面 |
+| numpy | 1.26.4 | 数值计算 |
+| scipy | 1.15.3 | 科学计算 |
+| pandas | 2.3.3 | 数据处理 |
+
+## 许可证
+
+本项目使用MIT许可证。详见LICENSE文件。
+
+## 贡献
+
+欢迎贡献代码和提出建议！请通过GitHub提交Pull Request或Issue。
+
+## 联系方式
+
+如有问题或建议，请联系项目维护者。

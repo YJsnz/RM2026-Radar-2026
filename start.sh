@@ -9,8 +9,8 @@ cd "$(dirname "$0")"
 # 海康相机SDK环境变量
 export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 
-# Python路径配置
-export PYTHONPATH=/home/geqingyu/RM2025-Radar-Algorithm-main/driver/hik_camera:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:$PYTHONPATH
+# Python路径配置（使用当前项目内的 hik_camera，确保能找到 MvImport）
+export PYTHONPATH="$(pwd)/driver/hik_camera:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:$PYTHONPATH"
 
 # 系统库路径配置
 export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
