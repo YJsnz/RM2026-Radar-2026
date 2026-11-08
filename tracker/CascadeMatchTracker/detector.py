@@ -1,339 +1,488 @@
-from model.pfa_yolov5.predictor import YOLOv5Detector
-from model.yolov12.predictor_with_tracker import PredictorWithTracker
-from model.yolov8.predictor import YOLOv8ONNXDetector
-from model.yolov8.classifier import YOLOv8ONNXClassifier
-from tracker.CascadeMatchTracker.type import TrackingState, SingleDetectionResult
-from typing import List, Optional
-import numpy as np
-import cv2
+import re
 import time
-from model.armor_detector import TwoStepArmorDetectorClassifier
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+from model.armor_pose_detector import ArmorPoseONNXDetector
+from model.ultralytics_yolo_detector import UltralyticsYOLODetector
+from tracker.CascadeMatchTracker.type import SingleDetectionResult, State, TrackingState
 
 
 class BaseDetector:
-
     def __init__(self, config, pixel_world_transform, visualize=False):
         super().__init__()
         self.device = config["device"]
-        self.class_names = config["armor_detector"]["class_names"]
         self.config = config
+        self.visualize = visualize
+        self.pixel_world_transform = pixel_world_transform
 
-        # 使用YOLOv8 ONNX模型
-        yolov8_onnx_path = "yolov8/ONNX/"
-        
-        # 车辆检测器 (使用RM2025.onnx)
-        self.car_detector = YOLOv8ONNXDetector(
-            model_path=yolov8_onnx_path + "RM2025.onnx",
+        self.class_names = config["armor_detector"]["class_names"]
+        self.class_name_to_id = {
+            class_name: class_id for class_id, class_name in enumerate(self.class_names)
+        }
+
+        self.raw_name_mapping = config["armor_detector"].get("raw_name_mapping", {})
+        self.color_name_mapping = {
+            int(key): str(value)
+            for key, value in config["armor_detector"].get(
+                "color_name_mapping",
+                {"0": "R", "1": "B", "2": "G", "3": "P"},
+            ).items()
+        }
+        self.object_name_mapping = {
+            str(key): str(value)
+            for key, value in config["armor_detector"].get(
+                "object_name_mapping",
+                {"0": "7", "1": "1", "2": "2", "3": "3", "4": "4", "5": "5"},
+            ).items()
+        }
+
+        self.car_detector = UltralyticsYOLODetector(
+            model_path=config["car_detector"]["weights_path"],
             img_size=config["car_detector"]["img_size"],
             max_det=config["car_detector"]["max_det"],
             conf_thres=config["car_detector"]["conf_thres"],
             iou_thres=config["car_detector"]["iou_thres"],
             device=self.device,
+            classes=config["car_detector"].get("classes"),
         )
 
-        # 装甲板检测器 (使用armor_yolo.onnx)
-        self.armor_detector = YOLOv8ONNXDetector(
-            model_path=yolov8_onnx_path + "armor_yolo.onnx",
-            img_size=config["armor_detector"]["img_size"],
-            max_det=config["armor_detector"]["max_det"],
+        self.armor_detector = ArmorPoseONNXDetector(
+            model_path=config["armor_detector"]["weights_path"],
             conf_thres=config["armor_detector"]["conf_thres"],
             iou_thres=config["armor_detector"]["iou_thres"],
+            max_det=config["armor_detector"]["max_det"],
             device=self.device,
         )
-
-        # 分类器 (使用classify.onnx)
-        self.classifier = YOLOv8ONNXClassifier(
-            model_path=yolov8_onnx_path + "classify.onnx",
-            conf_thres=0.3,  # 使用合理的阈值
-            device=self.device,
+        self.raw_armor_class_names = self.armor_detector.get_class_names()
+        self.detect_frame_index = 0
+        self.detect_full_frame_interval = max(
+            1, int(config["tracker"].get("detect_full_frame_interval", 3))
         )
+        self.detect_roi_expand_ratio = float(
+            config["tracker"].get("detect_roi_expand_ratio", 0.2)
+        )
+        self.detect_roi_min_margin = int(
+            config["tracker"].get("detect_roi_min_margin", 24)
+        )
+        self.detect_roi_img_size = int(
+            config["tracker"].get(
+                "detect_roi_img_size", config["car_detector"]["img_size"]
+            )
+        )
+        self.min_color_conf = float(config["tracker"].get("min_color_conf", 0.45))
+        self.min_color_margin = float(config["tracker"].get("min_color_margin", 0.08))
 
-        self.pixel_world_transform = pixel_world_transform
-        self.visualize = visualize
-
-        ## Initialize tracking state
         self.tracks = [
             TrackingState(class_id=class_id, name=class_name, max_frames=30)
-            for class_id, class_name in enumerate(self.class_names[:10])
+            for class_id, class_name in enumerate(self.class_names)
         ]
-    
+
+    def _parse_raw_class(self, raw_class_name: str) -> Optional[Tuple[str, str]]:
+        match = re.fullmatch(r"(s\d+)_o(\d+)", raw_class_name)
+        if not match:
+            return None
+        return match.groups()
+
+    def _map_detection_to_class_name(self, det: dict) -> Optional[str]:
+        raw_class_name = det["class_name"]
+        if raw_class_name in self.raw_name_mapping:
+            mapped_name = self.raw_name_mapping[raw_class_name]
+            if mapped_name in (None, "", "ignore", "IGNORE"):
+                return None
+            return str(mapped_name)
+
+        if raw_class_name in self.class_name_to_id:
+            return raw_class_name
+
+        parsed = self._parse_raw_class(raw_class_name)
+        if parsed is None:
+            return None
+
+        _, object_token = parsed
+        color_prefix = self._resolve_color_prefix(det)
+        object_suffix = self.object_name_mapping.get(object_token)
+        if color_prefix not in ("B", "R") or not object_suffix:
+            return None
+
+        mapped_name = f"{color_prefix}{object_suffix}"
+        return mapped_name if mapped_name in self.class_name_to_id else None
+
+    def _resolve_color_prefix(self, det: dict) -> Optional[str]:
+        color_scores = det.get("color_scores") or []
+        if not color_scores:
+            return self.color_name_mapping.get(det.get("color_id", -1))
+
+        color_scores_np = np.asarray(color_scores, dtype=np.float32)
+        best_idx = int(np.argmax(color_scores_np))
+        best_score = float(color_scores_np[best_idx])
+        second_score = 0.0
+        if color_scores_np.size > 1:
+            second_score = float(np.partition(color_scores_np, -2)[-2])
+
+        if best_score < self.min_color_conf:
+            return None
+        if best_score - second_score < self.min_color_margin:
+            return None
+        return self.color_name_mapping.get(best_idx)
+
     def xyxy2pos3d(self, xyxy):
-        """
-        将车辆边界框坐标转换为3D世界坐标
-        
-        注意：xyxy坐标应该是在原始图像尺寸上的坐标
-        如果检测器对图像进行了resize，需要先将坐标转换回原始图像尺寸
-        
-        Args:
-            xyxy: 车辆边界框坐标 [x1, y1, x2, y2]，应该是原始图像尺寸上的坐标
-            
-        Returns:
-            position_3d: 3D世界坐标 [x, y, z]
-        """
         x1, y1, x2, y2 = xyxy
-        # 使用车辆底部中心点进行坐标转换
         xo, yo = (x1 + x2) * 0.5, y2
-        # 像素坐标(u, v)传递给pixel_to_world
-        # 注意：pixel_to_world期望的坐标应该与相机内参矩阵对应的图像尺寸匹配
         if (
             position_3d := self.pixel_world_transform.pixel_to_world([xo, yo])
         ) is None:
             position_3d = np.array([0.0, 0.0, 0.0])
         return position_3d.tolist()
 
+    @staticmethod
+    def _sanitize_box(box: List[float], width: int, height: int) -> Optional[List[int]]:
+        x1, y1, x2, y2 = map(int, box)
+        x1 = max(0, min(width, x1))
+        x2 = max(0, min(width, x2))
+        y1 = max(0, min(height, y1))
+        y2 = max(0, min(height, y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return [x1, y1, x2, y2]
+
+    def _expand_box(
+        self, box: List[float], width: int, height: int
+    ) -> Optional[List[int]]:
+        sanitized = self._sanitize_box(box, width, height)
+        if sanitized is None:
+            return None
+
+        x1, y1, x2, y2 = sanitized
+        box_w = x2 - x1
+        box_h = y2 - y1
+        margin_x = max(self.detect_roi_min_margin, int(box_w * self.detect_roi_expand_ratio))
+        margin_y = max(self.detect_roi_min_margin, int(box_h * self.detect_roi_expand_ratio))
+        return self._sanitize_box(
+            [x1 - margin_x, y1 - margin_y, x2 + margin_x, y2 + margin_y],
+            width,
+            height,
+        )
+
+    @staticmethod
+    def _compute_iou(box_a: List[int], box_b: List[int]) -> float:
+        xa1, ya1, xa2, ya2 = box_a
+        xb1, yb1, xb2, yb2 = box_b
+        inter_x1 = max(xa1, xb1)
+        inter_y1 = max(ya1, yb1)
+        inter_x2 = min(xa2, xb2)
+        inter_y2 = min(ya2, yb2)
+        inter_w = max(0, inter_x2 - inter_x1)
+        inter_h = max(0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+        if inter_area <= 0:
+            return 0.0
+
+        area_a = max(0, xa2 - xa1) * max(0, ya2 - ya1)
+        area_b = max(0, xb2 - xb1) * max(0, yb2 - yb1)
+        denom = area_a + area_b - inter_area
+        return inter_area / denom if denom > 0 else 0.0
+
+    def _deduplicate_car_candidates(
+        self, candidates: List[Dict]
+    ) -> List[Dict]:
+        kept: List[Dict] = []
+        for candidate in sorted(candidates, key=lambda item: item["conf"], reverse=True):
+            if any(
+                self._compute_iou(candidate["bbox"], existing["bbox"]) > 0.6
+                for existing in kept
+            ):
+                continue
+            kept.append(candidate)
+        return kept
+
+    def _get_track_roi_hints(self, width: int, height: int) -> List[Dict]:
+        roi_hints: List[Dict] = []
+        for track in self.tracks:
+            if track.state not in (State.CONFIRMED, State.TENTATIVE, State.LOST):
+                continue
+            if track.car_box is None:
+                continue
+
+            roi_box = self._expand_box(track.car_box, width, height)
+            if roi_box is None:
+                continue
+
+            roi_hints.append(
+                {
+                    "roi_box": roi_box,
+                    "track_class_id": track.class_id,
+                    "track_bot_id": track.bot_id if track.bot_id >= 0 else None,
+                }
+            )
+        return roi_hints
+
+    def _predict_cars_full_frame(self, img: np.ndarray) -> List[Dict]:
+        img_height, img_width = img.shape[:2]
+        car_detections, _ = self.car_detector.predict(img)
+        candidates: List[Dict] = []
+        for cls_id, xyxy, conf in car_detections:
+            bbox = self._sanitize_box(xyxy, img_width, img_height)
+            if bbox is None:
+                continue
+            candidates.append(
+                {
+                    "class_id": cls_id,
+                    "bbox": bbox,
+                    "conf": float(conf),
+                    "track_bot_id": None,
+                }
+            )
+        return candidates
+
+    def _predict_cars_from_rois(self, img: np.ndarray) -> List[Dict]:
+        img_height, img_width = img.shape[:2]
+        roi_hints = self._get_track_roi_hints(img_width, img_height)
+        if not roi_hints:
+            return []
+
+        roi_images = []
+        valid_hints = []
+        for hint in roi_hints:
+            x1, y1, x2, y2 = hint["roi_box"]
+            roi_img = img[y1:y2, x1:x2]
+            if roi_img.size == 0:
+                continue
+            roi_images.append(roi_img)
+            valid_hints.append(hint)
+
+        if not roi_images:
+            return []
+
+        roi_detections_batch, _ = self.car_detector.predict_batch(
+            roi_images,
+            img_size_override=self.detect_roi_img_size,
+        )
+
+        candidates: List[Dict] = []
+        for hint, roi_detections in zip(valid_hints, roi_detections_batch):
+            roi_x1, roi_y1, _, _ = hint["roi_box"]
+            for cls_id, xyxy, conf in roi_detections:
+                local_box = self._sanitize_box(
+                    xyxy,
+                    hint["roi_box"][2] - hint["roi_box"][0],
+                    hint["roi_box"][3] - hint["roi_box"][1],
+                )
+                if local_box is None:
+                    continue
+
+                bbox = self._sanitize_box(
+                    [
+                        local_box[0] + roi_x1,
+                        local_box[1] + roi_y1,
+                        local_box[2] + roi_x1,
+                        local_box[3] + roi_y1,
+                    ],
+                    img_width,
+                    img_height,
+                )
+                if bbox is None:
+                    continue
+
+                candidates.append(
+                    {
+                        "class_id": cls_id,
+                        "bbox": bbox,
+                        "conf": float(conf),
+                        "track_bot_id": hint["track_bot_id"],
+                    }
+                )
+        return candidates
+
+    def _get_car_candidates(self, img: np.ndarray) -> List[Dict]:
+        self.detect_frame_index += 1
+        run_full_frame = (
+            self.detect_frame_index == 1
+            or self.detect_full_frame_interval <= 1
+            or self.detect_frame_index % self.detect_full_frame_interval == 0
+        )
+
+        candidates = (
+            self._predict_cars_full_frame(img)
+            if run_full_frame
+            else self._predict_cars_from_rois(img)
+        )
+        if not candidates and not run_full_frame:
+            candidates = self._predict_cars_full_frame(img)
+        return self._deduplicate_car_candidates(candidates)
+
+    def _select_armor_detection(self, armor_detections: List[dict]):
+        if not armor_detections:
+            return None, -1, ""
+
+        best_any = max(armor_detections, key=lambda det: det["confidence"])
+        mapped_candidates = []
+        for det in armor_detections:
+            mapped_name = self._map_detection_to_class_name(det)
+            if mapped_name is None:
+                continue
+            mapped_candidates.append(
+                (self.class_name_to_id[mapped_name], mapped_name, det)
+            )
+
+        if not mapped_candidates:
+            return best_any, -1, best_any["class_name"]
+
+        class_id, mapped_name, det = max(
+            mapped_candidates, key=lambda item: item[2]["confidence"]
+        )
+        return det, class_id, mapped_name
+
     def detect(
         self, img
     ) -> tuple[List[SingleDetectionResult], Optional[np.ndarray]]:
-        """
-        Preform full detection pipeline on the input image.
-        Args:
-            img: Input image in BGR format.
-        Returns:
-            A tuple containing a list of detection results and an optional image with visualizations.
-        """
-
         detections = []
-        img_copy = img
-        car_detections, _ = self.car_detector.predict(img_copy)
-
-        num_car_detections = len(car_detections)
-        if num_car_detections == 0:
-            return [], img_copy
+        img_height, img_width = img.shape[:2]
+        car_candidates = self._get_car_candidates(img)
+        if not car_candidates:
+            return [], img.copy()
 
         crop_imgs = []
         car_boxes = []
         car_confs = []
-        
-        for i, car_detection in enumerate(car_detections):
-            class_id, xyxy, conf = car_detection
-            x1, y1, x2, y2 = map(int, xyxy)
-            car_box = [x1, y1, x2, y2]
+        car_bot_ids = []
+
+        for idx, candidate in enumerate(car_candidates):
+            car_box = candidate["bbox"]
+            x1, y1, x2, y2 = car_box
+            crop = img[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+
             car_boxes.append(car_box)
-            car_confs.append(conf)
-            
-            # 确保边界框有效
-            if x1 < x2 and y1 < y2:
-                crop_img = img_copy[y1:y2, x1:x2]
-                crop_imgs.append(crop_img)
-            else:
-                crop_imgs.append(np.zeros((10, 10, 3), dtype=np.uint8))
+            car_confs.append(float(candidate["conf"]))
+            car_bot_ids.append(
+                candidate["track_bot_id"]
+                if candidate["track_bot_id"] is not None
+                else idx
+            )
+            crop_imgs.append(crop)
 
-        armor_detections, _ = self.armor_detector.predict_batch(crop_imgs)
+        if not crop_imgs:
+            return [], img.copy()
 
-        for i, (armor_detections, car_box, car_conf) in enumerate(zip(armor_detections, car_boxes, car_confs)):
-            track_id = i  # 使用索引作为临时track_id
-            
+        armor_detections_batch, _ = self.armor_detector.predict_batch(crop_imgs)
+
+        for bot_id, car_box, car_conf, armor_detections in zip(
+            car_bot_ids, car_boxes, car_confs, armor_detections_batch
+        ):
             position_3d = self.xyxy2pos3d(car_box)
+            selected_armor, class_id, mapped_class_name = self._select_armor_detection(
+                armor_detections
+            )
 
-            if len(armor_detections) == 0:
-                detection_result = SingleDetectionResult(
-                    class_id=-1,
-                    class_conf=0.0,
-                    bot_id=track_id,
+            armor_box = [0.0, 0.0, 0.0, 0.0]
+            armor_corners = None
+            class_conf = 0.0
+
+            raw_class_name = ""
+            if selected_armor is not None:
+                armor_box = selected_armor["bbox"]
+                armor_corners = selected_armor["keypoints"]
+                class_conf = float(selected_armor["confidence"])
+                raw_class_name = selected_armor["class_name"]
+
+            detections.append(
+                SingleDetectionResult(
+                    class_id=class_id,
+                    class_conf=class_conf,
+                    bot_id=bot_id,
                     car_box=car_box,
-                    armor_box=[0.0, 0.0, 0.0, 0.0],
+                    armor_box=armor_box,
                     car_conf=car_conf,
                     pos_3d=position_3d,
                     time_stamp=time.time(),
+                    raw_class_name=raw_class_name if raw_class_name else mapped_class_name,
+                    armor_corners=armor_corners,
                 )
-                detections.append(detection_result)
-                continue
-
-            max_armor_confidence_detection = max(
-                armor_detections, key=lambda x: x[2], default=None
             )
 
-            if max_armor_confidence_detection:
-                armor_class_id, armor_box, armor_conf = max_armor_confidence_detection
-                
-                # 参考另一个项目的逻辑
-                class_id = -1
-                class_conf = 0.0
-                
-                # 1. 首先获取装甲板区域的图像
-                armor_x1, armor_y1, armor_x2, armor_y2 = armor_box
-                armor_x1 = max(0, int(armor_x1))
-                armor_y1 = max(0, int(armor_y1))
-                
-                # 使用裁剪后的图像尺寸作为边界
-                armor_roi = None
-                if len(crop_imgs[i]) > 0:
-                    armor_x2 = min(crop_imgs[i].shape[1], int(armor_x2))
-                    armor_y2 = min(crop_imgs[i].shape[0], int(armor_y2))
-                    
-                    if armor_x2 > armor_x1 and armor_y2 > armor_y1:
-                        armor_roi = crop_imgs[i][armor_y1:armor_y2, armor_x1:armor_x2]
-                
-                # 2. 颜色检测函数
-                # 注意：这里的图像来源于 OpenCV 的裁剪，因此是 BGR 格式
-                # channels[0]=B, channels[1]=G, channels[2]=R
-                def get_color(img):
-                    if img is None or img.size == 0:
-                        return 1  # 默认灰色
-                    channels = cv2.split(img)
-                    if len(channels) != 3:
-                        return 1
-
-                    # 对于 BGR 格式：channels[0]=B, channels[2]=R
-                    # 计算各通道均值（正确索引）
-                    blue_mean = cv2.mean(channels[0])[0]  # B通道
-                    red_mean = cv2.mean(channels[2])[0]  # R通道
-
-                    # 直接比较红色和蓝色通道的均值
-                    if red_mean > blue_mean:
-                        return 1  # 红色
-                    else:
-                        return 0  # 蓝色
-                
-                # 3. 对装甲板区域进行分类
-                class_id = -1
-                class_conf = 0.0
-                if armor_roi is not None:
-                    # 使用分类器对装甲板区域进行分类
-                    classify_detections, _ = self.classifier.predict(armor_roi)
-                    if classify_detections:
-                        # 分类模型直接返回类别ID和置信度
-                        classify_id, _, classify_conf = classify_detections[0]
-                        
-                        # 4. 获取装甲板区域的颜色
-                        color = get_color(armor_roi)
-                        
-                        # 5. 直接使用分类模型的输出进行编号分配
-                        # 按照分类模型的实际输出确定机器人编号
-                        # 分类模型返回0-3表示机器人编号1-4
-                        robot_number = classify_id + 1  # 转换为1-based编号
-                        
-                        # 确保编号在有效范围内
-                        if robot_number < 1:
-                            robot_number = 1
-                        elif robot_number > 4:
-                            robot_number = 4
-                        
-                        # 根据颜色确定最终类别
-                        # color: 0=蓝色, 1=红色, 其他=灰色
-                        if color == 1:
-                            # 红色机器人
-                            if robot_number == 1:
-                                class_id = 0  # R1
-                            elif robot_number == 2:
-                                class_id = 1  # R2
-                            elif robot_number == 3:
-                                class_id = 2  # R3
-                            elif robot_number == 4:
-                                class_id = 3  # R4
-                        elif color == 0:
-                            # 蓝色机器人
-                            if robot_number == 1:
-                                class_id = 5  # B1
-                            elif robot_number == 2:
-                                class_id = 6  # B2
-                            elif robot_number == 3:
-                                class_id = 7  # B3
-                            elif robot_number == 4:
-                                class_id = 8  # B4
-                        
-                        # 确保分类置信度正确赋值
-                        class_conf = classify_conf
-                
-                # 确保类别ID在有效范围内
-                if class_id < 0 or class_id >= len(self.class_names):
-                    class_id = -1
-                    class_conf = 0.0
-                
-                detection_result = SingleDetectionResult(
-                    class_id=class_id,
-                    class_conf=class_conf,
-                    bot_id=track_id,
-                    car_box=car_box,
-                    armor_box=list(map(int, armor_box)),
-                    car_conf=car_conf,
-                    pos_3d=position_3d,  # Placeholder for 3D position
-                    time_stamp=time.time(),
-                )
-                detections.append(detection_result)
         vis_img = None
         if self.visualize:
-            vis_img = self._get_visualized_img(img_copy, detections)
+            vis_img = self._get_visualized_img(img, detections)
         return detections, vis_img
 
     def _get_visualized_img(self, img, detections):
-        # 使用原图尺寸直接绘制，避免每帧 resize 带来的开销
         vis_img = img.copy()
-
-        # 缩放因子设为 1（坐标已经是原图尺寸）
-        scale_x = 1.0
-        scale_y = 1.0
-        height, width = vis_img.shape[:2]
-
         for detection in detections:
-            ## Draw car bounding box
             x1_car, y1_car, x2_car, y2_car = map(int, detection.car_box)
-            label = f"Car: {detection.car_conf:.2f} ID: {detection.bot_id}"
             cv2.rectangle(vis_img, (x1_car, y1_car), (x2_car, y2_car), (0, 255, 0), 2)
             cv2.putText(
                 vis_img,
-                label,
-                (x1_car, y1_car - 10),
+                f"Car: {detection.car_conf:.2f} ID:{detection.bot_id}",
+                (x1_car, max(20, y1_car - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 (0, 255, 0),
                 2,
             )
 
-            ## Draw armor detection if any
-            class_id = detection.class_id
-            # 检查装甲板边界框是否有效，而不是检查class_id
             armor_box = detection.armor_box
-            if len(armor_box) == 4:
-                x1_armor, y1_armor, x2_armor, y2_armor = map(int, armor_box)
-                # 确保装甲板边界框有效
-                if x2_armor > x1_armor and y2_armor > y1_armor:
-                    x1_armor = int(x1_armor + detection.car_box[0])
-                    y1_armor = int(y1_armor + detection.car_box[1])
-                    x2_armor = int(x2_armor + detection.car_box[0])
-                    y2_armor = int(y2_armor + detection.car_box[1])
+            if len(armor_box) != 4:
+                continue
 
-                    # 确定标签和颜色
-                    if class_id >= 0 and class_id < len(self.class_names):
-                        label = f"{self.class_names[class_id]}: {detection.class_conf:.2f}"
-                        if class_id < 4:  # red
-                            color = (0, 0, 255)  # 红色框
-                        elif class_id < 9:  # blue
-                            color = (255, 0, 0)  # 蓝色框
-                        else:  # grey
-                            color = (255, 255, 255)  # 白色框
-                    else:
-                        label = f"Armor: {detection.class_conf:.2f}"
-                        color = (0, 255, 255)  # 黄色框
+            x1_armor, y1_armor, x2_armor, y2_armor = armor_box
+            if x2_armor <= x1_armor or y2_armor <= y1_armor:
+                continue
 
-                    cv2.rectangle(
-                        vis_img, (x1_armor, y1_armor), (x2_armor, y2_armor), color, 2
-                    )
-                    cv2.putText(
-                        vis_img,
-                        label,
-                        (x1_armor, y1_armor - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        2,
-                    )
+            x1_armor = int(x1_armor + detection.car_box[0])
+            y1_armor = int(y1_armor + detection.car_box[1])
+            x2_armor = int(x2_armor + detection.car_box[0])
+            y2_armor = int(y2_armor + detection.car_box[1])
+
+            if 0 <= detection.class_id < len(self.class_names):
+                label = f"{self.class_names[detection.class_id]}: {detection.class_conf:.2f}"
+                color = (255, 0, 0) if detection.class_id < 6 else (0, 0, 255)
+            elif detection.raw_class_name:
+                label = f"{detection.raw_class_name}: {detection.class_conf:.2f}"
+                color = (0, 255, 255)
+            else:
+                label = f"Armor: {detection.class_conf:.2f}"
+                color = (0, 255, 255)
+
+            cv2.rectangle(
+                vis_img, (x1_armor, y1_armor), (x2_armor, y2_armor), color, 2
+            )
+            cv2.putText(
+                vis_img,
+                label,
+                (x1_armor, max(20, y1_armor - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+            )
+
+            if detection.armor_corners and len(detection.armor_corners) == 8:
+                corners = np.array(detection.armor_corners, dtype=np.float32).reshape(
+                    -1, 2
+                )
+                corners[:, 0] += detection.car_box[0]
+                corners[:, 1] += detection.car_box[1]
+                corners = corners.astype(np.int32)
+                cv2.polylines(vis_img, [corners], isClosed=True, color=color, thickness=2)
+
         return vis_img
 
 
 if __name__ == "__main__":
     import yaml
     from transform.ray_renderer import PixelToWorld
-    import numpy as np
 
     config = yaml.safe_load(open("config/params.yaml", "r"))
     pixel_world_transform = PixelToWorld.build_from_config(config)
-    tracker = BaseDetector(config, pixel_world_transform, visualize=True)
+    detector = BaseDetector(config, pixel_world_transform, visualize=True)
 
-    img = cv2.imread("test_assets/ustgz_0.jpg")
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    result, vis_img = tracker.detect(img)
-    vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
-    vis_img = cv2.resize(vis_img, (1536, 1024))
-    cv2.imshow("Detection Result", vis_img)
-    cv2.waitKey(0)
+    img = cv2.imread("demo/demo1.jpg")
+    result, vis_img = detector.detect(img)
+    print(result)
+    if vis_img is not None:
+        cv2.imshow("Detection Result", vis_img)
+        cv2.waitKey(0)

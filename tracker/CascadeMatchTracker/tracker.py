@@ -11,9 +11,12 @@ from scipy.optimize import linear_sum_assignment
 import numpy as np
 import cv2
 import time
+import logging
 from .type import BotIdTrack
 from driver.referee.referee_comm import FACTION
 from transform.solidwork2uwb import solidwork2uwb
+
+logger = logging.getLogger(__name__)
 
 
 class CascadeMatchTracker(BaseDetector):
@@ -158,43 +161,7 @@ class CascadeMatchTracker(BaseDetector):
         if self.frame_count > 1:
             self.real_dt = now - self.last
         self.last = now
-        ## step1: run detection and initialize botid trajectory
-
-        detections, detect_vis_img = self.detect(img)
-        
-        for det in detections:
-            if det.bot_id not in self.bot_id_trajectories:
-                self.bot_id_trajectories[det.bot_id] = BotIdTrack(
-                    bot_id=det.bot_id, class_id=det.class_id, class_conf=det.class_conf
-                )
-            else:
-                if det.class_id != -1:
-                    self.bot_id_trajectories[det.bot_id].update(det.class_id, det.class_conf)  # Update with actual confidence
-                else:
-                    self.bot_id_trajectories[det.bot_id].update(-1, det.class_conf)  # Update with -1 if not updated
-            self.bot_id_trajectories[det.bot_id].updated = True
-        
-        # 收集需删除的bot_id
-        to_delete = []
-        for bot_id_trajectory in self.bot_id_trajectories.values():
-            if not bot_id_trajectory.updated:
-                bot_id_trajectory.update(-1, 1.0)
-                bot_id_trajectory.lost_counter += 1
-                if bot_id_trajectory.lost_counter >= 30:
-                    to_delete.append(bot_id_trajectory.bot_id)
-                    print(f"[CascadeMatchTracker]: Bot ID {bot_id_trajectory.bot_id} trajectory deleted due to timeout.")
-
-        # 删除超时的轨迹
-        for bot_id in to_delete:
-            del self.bot_id_trajectories[bot_id]
-
-        # 重置updated标志
-        for bot_id_trajectory in self.bot_id_trajectories.values():
-            bot_id_trajectory.updated = False
-                
-        # detections = self.nms(detections, iou_threshold=0.5)
-
-        ## step2: Kalman filter state interpolation for tracks that is TENTATIVE or CONFIRMED
+        ## step1: Kalman filter state interpolation, providing ROI hints to the detector
         for track in self.tracks:
             if track.state in [State.LOST, State.CONFIRMED]:
                 track.pos_2d_uwb = track.kalman_filter_2d.predict(dt = self.real_dt)[0]
@@ -205,29 +172,66 @@ class CascadeMatchTracker(BaseDetector):
                 track.pos_3d = self.xyxy2pos3d(xyxy)
                 track.pos_2d_uwb_det = solidwork2uwb(track.pos_3d, faction)
                 track.kalman_filter_2d.update(track.pos_2d_uwb_det)
-                
+        
+        ## step2: run detection and initialize botid trajectory
+        detections, detect_vis_img = self.detect(img)
+
+        for det in detections:
+            if det.bot_id not in self.bot_id_trajectories:
+                self.bot_id_trajectories[det.bot_id] = BotIdTrack(
+                    bot_id=det.bot_id,
+                    class_id=det.class_id,
+                    class_conf=det.class_conf,
+                    num_classes=len(self.tracks),
+                )
+            else:
+                if det.class_id != -1:
+                    self.bot_id_trajectories[det.bot_id].update(det.class_id, det.class_conf)
+                else:
+                    self.bot_id_trajectories[det.bot_id].update(-1, det.class_conf)
+            self.bot_id_trajectories[det.bot_id].updated = True
+
+        to_delete = []
+        for bot_id_trajectory in self.bot_id_trajectories.values():
+            if not bot_id_trajectory.updated:
+                bot_id_trajectory.update(-1, 1.0)
+                bot_id_trajectory.lost_counter += 1
+                if bot_id_trajectory.lost_counter >= 30:
+                    to_delete.append(bot_id_trajectory.bot_id)
+                    logger.info(
+                        "Bot ID %s trajectory deleted due to timeout.",
+                        bot_id_trajectory.bot_id,
+                    )
+            else:
+                bot_id_trajectory.lost_counter = 0
+
+        for bot_id in to_delete:
+            del self.bot_id_trajectories[bot_id]
+
+        for bot_id_trajectory in self.bot_id_trajectories.values():
+            bot_id_trajectory.updated = False
 
         ## step3: Match detections with existing tracks
-
-        ## i): Build the cost matrix
         N, M = len(detections), len(self.tracks)
-        cost_matrix = np.zeros((M, N), dtype=np.float32)
-
-        for i, track in enumerate(self.tracks):
-            for j, det in enumerate(detections):
-                score = self._compute_score(track, det)
-                cost_matrix[i, j] = -1.0 * score  # 取负值，因为我们要最小化成本
-        ## ii): Hungarian matching
-        matches_temp = linear_sum_assignment(cost_matrix)
-        ## Filter out the high-cost matches with state-specific thresholds
         matches = []
-        for i, j in zip(*matches_temp):
-            track = self.tracks[i]
-            threshold = self.INACTIVE_COST_THRESHOLD if (track.state == State.INACTIVE or track.state == State.TENTATIVE) else self.COST_THRESHOLD
-            if cost_matrix[i, j] < threshold:
-                matches.append((i, j))
-        
-        ## Find the matched track and the unmatched track
+        if N > 0 and M > 0:
+            cost_matrix = np.zeros((M, N), dtype=np.float32)
+            for i, track in enumerate(self.tracks):
+                for j, det in enumerate(detections):
+                    score = self._compute_score(track, det)
+                    cost_matrix[i, j] = -1.0 * score
+
+            matches_temp = linear_sum_assignment(cost_matrix)
+            for i, j in zip(*matches_temp):
+                track = self.tracks[i]
+                threshold = (
+                    self.INACTIVE_COST_THRESHOLD
+                    if track.state in (State.INACTIVE, State.TENTATIVE)
+                    else self.COST_THRESHOLD
+                )
+                if cost_matrix[i, j] < threshold:
+                    matches.append((i, j))
+
         matched_track_det = [(self.tracks[i], detections[j]) for (i, j) in matches]
         unmatched_tracks = [
             track
@@ -238,64 +242,65 @@ class CascadeMatchTracker(BaseDetector):
         ## step4: Update the track based on the matching
         ## Matched tracks
         for track, det in matched_track_det:
-            track.is_dead = True if det.class_id >= 10 else False
+            track.is_dead = False
+            previous_bot_id = track.bot_id
+            det_pos_3d = self.xyxy2pos3d(det.car_box)
+            det_pos_2d_uwb = solidwork2uwb(det_pos_3d, faction)
+            track.car_box = det.car_box
+            track.pos_3d = det_pos_3d
+            track.pos_2d_uwb_det = det_pos_2d_uwb
+            track.pos_2d_uwb = det_pos_2d_uwb
+            track.bot_id = det.bot_id
+            track.is_start_guess = False
             if track.state == State.INACTIVE:
                 track.state = State.TENTATIVE
                 track.hit_count = 0
-                track.inacitve_count = 0
+                track.inactive_count = 0
             elif track.state == State.TENTATIVE:
                 track.hit_count += 1
                 if track.hit_count >= self.HIT_COUNT_THRESHOLD:
                     track.is_active = True
                     track.state = State.CONFIRMED
                     initial_xywh = xyxy2xywh(det.car_box)
-                    initial_pos_3d = self.xyxy2pos3d(det.car_box)
-                    initial_pos_2d_uwb = solidwork2uwb(initial_pos_3d, faction)
                     track.kalman_filter.reset(initial_xywh)
-                    track.kalman_filter_2d.reset(initial_pos_2d_uwb)
+                    track.kalman_filter_2d.reset(det_pos_2d_uwb)
             elif track.state == State.CONFIRMED:
                 ## Associate the bot id with the track
                 track.is_active = True
                 
                 ## Jump condition: The bot id is not the same with the track's bot id
-                if track.bot_id != det.bot_id:
+                if previous_bot_id != det.bot_id:
                     # Reset the Kalman filter with the new detection
-                    initial_xywh = det.car_box
-                    initial_pos_3d = self.xyxy2pos3d(det.car_box)
-                    initial_pos_2d_uwb = solidwork2uwb(initial_pos_3d, faction)
                     track.kalman_filter.reset(xyxy2xywh(det.car_box))
-                    track.kalman_filter_2d.reset(initial_pos_2d_uwb)
+                    track.kalman_filter_2d.reset(det_pos_2d_uwb)
                 else:
                     track.kalman_filter.update(xyxy2xywh(det.car_box))
                     ## Outlier filtering
                     norm = np.linalg.norm(
-                        np.array(track.kalman_filter_2d.get_position()) - np.array(track.pos_2d_uwb_det)
+                        np.array(track.kalman_filter_2d.get_position())
+                        - np.array(det_pos_2d_uwb)
                     )
                     OUTLIER_THRESHOLD = 1.5
                     if norm < OUTLIER_THRESHOLD:
-                        track.kalman_filter_2d.update(track.pos_2d_uwb_det)
-
-                track.bot_id = det.bot_id
+                        track.kalman_filter_2d.update(det_pos_2d_uwb)
+                track.pos_2d_uwb = track.kalman_filter_2d.get_position()
             elif track.state == State.LOST:
                 ## Associate the bot id with the track
                 track.is_active = True
 
                 ## Jump condition: The bot id is not the same with the track's bot id
-                if track.bot_id != det.bot_id:
+                if previous_bot_id != det.bot_id:
                     # Reset the Kalman filter with the new detection
-                    initial_xywh = det.car_box
-                    initial_pos_3d = self.xyxy2pos3d(det.car_box)
-                    initial_pos_2d_uwb = solidwork2uwb(initial_pos_3d, faction)
                     track.kalman_filter.reset(xyxy2xywh(det.car_box))
-                    track.kalman_filter_2d.reset(initial_pos_2d_uwb)
+                    track.kalman_filter_2d.reset(det_pos_2d_uwb)
                     ## Debug: print in red
                 else:
                     track.kalman_filter.update(xyxy2xywh(det.car_box))
-                    track.kalman_filter_2d.update(track.pos_2d_uwb_det)
+                    track.kalman_filter_2d.update(det_pos_2d_uwb)
         
                 track.miss_count = 0
                 track.state = State.CONFIRMED
-                track.bot_id = det.bot_id
+                track.pos_2d_uwb = track.kalman_filter_2d.get_position()
 
         for track in unmatched_tracks:
             if track.state == State.INACTIVE:
@@ -315,7 +320,11 @@ class CascadeMatchTracker(BaseDetector):
                 if track.miss_count >= self.MISS_COUNT_THRESHOLD:
                     track.guess_point = self.point_guesser.predict_points(track, ref_color = "blue" if self.faction == FACTION.BLUE else "red")
                     track.is_start_guess = True
-                    print(f"[CascadeMatchTracker]: Track lost, guess point set {track.guess_point} for robot:", track.class_id)
+                    logger.info(
+                        "Track lost, guess point set %s for robot %s",
+                        track.guess_point,
+                        track.class_id,
+                    )
                     
                     # track.box_trajectories.clear()
                     track.bot_id = -1 # Reset bot_id assotiation when track is inactive
@@ -340,10 +349,16 @@ class CascadeMatchTracker(BaseDetector):
     
     def warmup(self, warmup_num = 20, img_path = "./tracker/warmup_image.jpg") -> None:
         """预热函数，执行一定数量的检测以初始化模型"""
-        img = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
-        for num in range(warmup_num):
-            detections, _ = self.detect(img)
-            print(f"[tracker]: Doing warm up {num}", )
+        if warmup_num <= 0:
+            return
+        img_bgr = cv2.imread(img_path)
+        if img_bgr is None:
+            logger.warning("Warmup image not found: %s", img_path)
+            return
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        for _ in range(warmup_num):
+            self.detect(img)
+        logger.info("Tracker warmup completed with %d iterations.", warmup_num)
 
     def visualize_results(
         self,
@@ -364,7 +379,7 @@ class CascadeMatchTracker(BaseDetector):
         for class_id, track in tracking_states.items():
             if not track.is_active or track.car_box is None:
                 continue
-            color = (0, 0, 255) if class_id < 4 else (255, 0, 0)
+            color = (255, 0, 0) if class_id < 6 else (0, 0, 255)
             x1, y1, x2, y2 = map(int, track.car_box)
             cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, 2)
             label = f"{track.name} BOT ID:{track.bot_id} State:{track.state.value}"
@@ -374,7 +389,7 @@ class CascadeMatchTracker(BaseDetector):
                 (x1, y1 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
-                (0, 0, 255) if class_id < 4 else (255, 0, 0),
+                color,
                 2,
             )
 

@@ -11,6 +11,13 @@ export MVCAM_COMMON_RUNENV=/opt/MVS/lib
 
 # Python路径配置（使用当前项目内的 hik_camera，确保能找到 MvImport）
 export PYTHONPATH="$(pwd)/driver/hik_camera:/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:$PYTHONPATH"
+# 禁用 ~/.local 中的用户级 Python 包，避免 CUDA 13/cuDNN 9.20 与当前环境的
+# CUDA 12/cuDNN 9.1 混用后导致 cudnnGetLibConfig 符号冲突。
+export PYTHONNOUSERSITE=1
+export YOLO_CONFIG_DIR=/tmp/ultralytics
+export ULTRALYTICS_SETTINGS_DIR=/tmp/ultralytics
+export XDG_CONFIG_HOME=/tmp
+export MPLCONFIGDIR=/tmp/matplotlib
 
 # 系统库路径配置
 export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
@@ -31,8 +38,9 @@ export QT_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/qt5/plugins
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libQt5Core.so.5:/usr/lib/x86_64-linux-gnu/libQt5Gui.so.5:/usr/lib/x86_64-linux-gnu/libQt5Widgets.so.5
 
 # ========== 环境激活 ==========
-# 激活虚拟环境
-source /home/geqingyu/miniconda3/envs/rm2026-radar/bin/activate
+# 通过 Conda 的 shell 钩子激活虚拟环境。envs/<name>/bin/activate 并不存在。
+source /home/geqingyu/miniconda3/etc/profile.d/conda.sh
+conda activate rm2026-radar
 
 # 激活ROS2 Humble环境
 source /opt/ros/humble/setup.bash
@@ -50,9 +58,14 @@ export LD_LIBRARY_PATH=/home/geqingyu/miniconda3/envs/rm2026-radar/lib/python3.1
 echo "=== RM2025 Radar Algorithm System 启动 ==="
 echo "环境变量配置:"
 echo "- PYTHONPATH: $PYTHONPATH"
+echo "- PYTHONNOUSERSITE: $PYTHONNOUSERSITE"
 echo "- LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 echo "- MVCAM_COMMON_RUNENV: $MVCAM_COMMON_RUNENV"
 echo "- QT_QPA_PLATFORM_PLUGIN_PATH: $QT_QPA_PLATFORM_PLUGIN_PATH"
+echo "- YOLO_CONFIG_DIR: $YOLO_CONFIG_DIR"
+echo "- ULTRALYTICS_SETTINGS_DIR: $ULTRALYTICS_SETTINGS_DIR"
+echo "- XDG_CONFIG_HOME: $XDG_CONFIG_HOME"
+echo "- MPLCONFIGDIR: $MPLCONFIGDIR"
 
 cat << "EOF"
 ╔════════════════════════════════╗

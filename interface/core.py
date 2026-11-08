@@ -14,6 +14,7 @@ from .interfactive_display import ZoomableDraggableLabel
 import numpy as np
 import cv2
 import logging
+import yaml
 from driver.referee.referee_comm import RefereeCommManager
 
 logging.basicConfig(
@@ -29,7 +30,10 @@ class RadarStationMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("RoboMaster 2026 雷达站控制界面")
-        self.setGeometry(100, 100, 2048, 1534)
+        self.resize(1720, 1080)
+        self.setMinimumSize(1366, 900)
+        with open("config/params.yaml", "r") as file:
+            self.runtime_config = yaml.safe_load(file)
 
         # 初始化UI组件
         self.init_ui()
@@ -40,11 +44,8 @@ class RadarStationMainWindow(QMainWindow):
         # 初始化数据更新定时器
         self.setup_timers()
         self.logger = logging.getLogger("RadarStation UI")
-        import yaml
-        with open("config/params.yaml", "r") as file:
-            config = yaml.safe_load(file)
-        
-        if config["debug"]["inference_video"]:
+
+        if self.runtime_config["debug"]["inference_video"]:
             from driver.hik_camera.mock_hik import SimpleHikCamera
         else:
             from driver.hik_camera.hik import SimpleHikCamera
@@ -65,6 +66,8 @@ class RadarStationMainWindow(QMainWindow):
 
         # 创建主布局
         main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
 
         # 左侧区域：相机图像和雷达点云
         left_panel = self.create_image_panel()
@@ -75,45 +78,45 @@ class RadarStationMainWindow(QMainWindow):
         # 右侧区域：控制面板和状态监控
         right_panel = self.create_control_panel()
 
-        # 添加到主布局
-        main_layout.addWidget(left_panel, 2)  # 左侧占2/5
-        main_layout.addWidget(center_panel, 2)  # 中间占2/5
-        main_layout.addWidget(right_panel, 1)  # 右侧占1/5
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(left_panel)
+        splitter.addWidget(center_panel)
+        splitter.addWidget(right_panel)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 1)
+        splitter.setSizes([900, 560, 260])
+
+        main_layout.addWidget(splitter)
 
     # 修改原有的RadarStationMainWindow类中的create_image_panel方法
     def create_image_panel(self):
         """创建图像显示面板"""
         panel = QGroupBox("图像显示")
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
-        # 相机图像显示
-        
-        self.target_camera_size = QSize(819, 700)  # 调整为更匀称的大小
-        self.target_tracker_size = QSize(819, 700)
-        
         self.camera_label = QLabel("相机图像")
-        self.camera_label.setMinimumSize(self.target_camera_size)
+        self.camera_label.setMinimumSize(320, 240)
+        self.camera_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.camera_label.setStyleSheet("border: 1px solid black")
         self.camera_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.camera_label)
+        layout.addWidget(self.camera_label, 1)
 
-        # 雷达点云显示（可选）
         self.tracker_label = QLabel("Tracker")
-        self.tracker_label.setMinimumSize(self.target_tracker_size)
+        self.tracker_label.setMinimumSize(320, 240)
+        self.tracker_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.tracker_label.setStyleSheet("border: 1px solid black")
         self.tracker_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.tracker_label)
-        
+        layout.addWidget(self.tracker_label, 1)
 
-
-        # 相机控制按钮
         camera_controls = QHBoxLayout()
+        camera_controls.setSpacing(8)
 
-        # Basic control of camera
         basic_controls = QHBoxLayout()
-      
         self.keypoint_btn = QPushButton("标关键点")
-
         basic_controls.addWidget(self.keypoint_btn)
         camera_controls.addLayout(basic_controls)
 
@@ -186,10 +189,13 @@ class RadarStationMainWindow(QMainWindow):
         """创建场地投影面板"""
         panel = QGroupBox("场地实时投影")
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
         # 场地投影显示区域
         self.field_view = FieldProjectionWidget()
-        layout.addWidget(self.field_view)
+        self.field_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.field_view, 1)
 
         # 投影控制选项
         controls = QHBoxLayout()
@@ -214,6 +220,8 @@ class RadarStationMainWindow(QMainWindow):
         """创建控制和状态面板"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
 
         # 状态监控面板
         status_panel = self.create_status_panel()
@@ -226,6 +234,7 @@ class RadarStationMainWindow(QMainWindow):
         # 系统信息面板
         system_panel = self.create_system_panel()
         layout.addWidget(system_panel)
+        layout.addStretch(1)
 
         return panel
 
@@ -376,15 +385,22 @@ class RadarStationMainWindow(QMainWindow):
 
     def setup_timers(self):
         """设置定时器用于数据更新"""
+        image_interval_ms = int(
+            self.runtime_config["debug"].get("ui_image_interval_ms", 50)
+        )
+        status_interval_ms = int(
+            self.runtime_config["debug"].get("ui_status_interval_ms", 250)
+        )
+
         # 图像更新定时器
         self.image_timer = QTimer()
         self.image_timer.timeout.connect(self.update_images)
-        self.image_timer.start(33)  # 30 FPS
+        self.image_timer.start(image_interval_ms)
 
         # 状态更新定时器
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.update_status)
-        self.status_timer.start(100)  # 1秒更新一次
+        self.status_timer.start(status_interval_ms)
 
     def start_tracking(self):
         # if self.calibrated_R is not None and self.calibrated_T is not None:
@@ -408,15 +424,17 @@ class RadarStationMainWindow(QMainWindow):
     def display_image(self, image, label_widget):
         """显示图像到指定的标签控件"""
         if image is not None:
-            # 将OpenCV图像转换为QImage
             height, width, channel = image.shape
             bytes_per_line = channel * width
             q_image = QImage(
                 image.data, width, height, bytes_per_line, QImage.Format_RGB888
-            )
+            ).copy()
             pixmap = QPixmap.fromImage(q_image)
+            target_size = label_widget.contentsRect().size()
+            if target_size.width() <= 1 or target_size.height() <= 1:
+                target_size = QSize(640, 480)
             pixmap = pixmap.scaled(
-                self.target_camera_size, Qt.IgnoreAspectRatio, Qt.FastTransformation
+                target_size, Qt.KeepAspectRatio, Qt.FastTransformation
             )
             label_widget.setPixmap(pixmap)
         else:
@@ -424,7 +442,7 @@ class RadarStationMainWindow(QMainWindow):
 
     def update_images(self):
         """更新图像显示"""
-        image, time_stamp = self.camera.get_image_latest("radar_station", timeout=1)
+        image, time_stamp = self.camera.get_image_latest("radar_station", timeout=0.05)
         if image is not None:
             if (
                 hasattr(self, "main_event_loop")
@@ -900,9 +918,9 @@ class FieldProjectionWidget(QWidget):
                 continue
 
             # 检查显示控制
-            if class_id < 5 and not self.show_ally:  # 蓝方
+            if class_id < 6 and not self.show_ally:  # 蓝方
                 continue
-            if class_id >= 5 and not self.show_enemy:  # 红方
+            if class_id >= 6 and not self.show_enemy:  # 红方
                 continue
 
             # 坐标转换
@@ -920,7 +938,7 @@ class FieldProjectionWidget(QWidget):
             y_widget = max(int(offset_y), min(int(offset_y + display_height), y_widget))
 
             # 确定颜色
-            if class_id < 5:  # 蓝方
+            if class_id < 6:  # 蓝方
                 color = QColor(0, 100, 255)
             else:  # 红方
                 color = QColor(255, 50, 50)
@@ -988,9 +1006,9 @@ class FieldProjectionWidget(QWidget):
                 continue
 
             # 检查显示控制
-            if class_id < 5 and not self.show_ally:
+            if class_id < 6 and not self.show_ally:
                 continue
-            if class_id >= 5 and not self.show_enemy:
+            if class_id >= 6 and not self.show_enemy:
                 continue
 
             # 坐标转换
@@ -1024,14 +1042,14 @@ class FieldProjectionWidget(QWidget):
             y_widget = max(int(offset_y), min(int(offset_y + display_height), y_widget))
 
             # 确定标签和颜色
-            if class_id < 5:  # 蓝方
+            if class_id < 6:  # 蓝方
                 text_color = QColor(0, 100, 255)
-                robot_names = ["B1", "B2", "B3", "B4", "B7"]
+                robot_names = ["B1", "B2", "B3", "B4", "B5", "B7"]
                 label = robot_names[class_id]
             else:  # 红方
                 text_color = QColor(255, 50, 50)
-                robot_names = ["R1", "R2", "R3", "R4", "R7"]
-                label = robot_names[class_id - 5]
+                robot_names = ["R1", "R2", "R3", "R4", "R5", "R7"]
+                label = robot_names[class_id - 6]
 
             # 准备显示文本
             coord_text = f"{label}\n({pos.x:.0f}, {pos.y:.0f})"
@@ -1164,9 +1182,9 @@ class FieldProjectionWidget(QWidget):
                 continue
 
             # 检查显示控制
-            if class_id < 5 and not self.show_ally:  # 蓝方
+            if class_id < 6 and not self.show_ally:  # 蓝方
                 continue
-            if class_id >= 5 and not self.show_enemy:  # 红方
+            if class_id >= 6 and not self.show_enemy:  # 红方
                 continue
 
             # 坐标范围限制 (clamp)
@@ -1191,16 +1209,16 @@ class FieldProjectionWidget(QWidget):
             y_widget = max(int(offset_y), min(int(offset_y + display_height), y_widget))
 
             # 确定颜色和标签
-            if class_id < 5:  # 蓝方 B1-B4, B7
+            if class_id < 6:  # 蓝方 B1-B5, B7
                 color = QColor(0, 100, 255)  # 蓝色
                 text_color = QColor(0, 100, 255)  # 蓝色文字
-                robot_names = ["B1", "B2", "B3", "B4", "B7"]
+                robot_names = ["B1", "B2", "B3", "B4", "B5", "B7"]
                 label = robot_names[class_id]
-            else:  # 红方 R1-R4, R7
+            else:  # 红方 R1-R5, R7
                 color = QColor(255, 50, 50)  # 红色
                 text_color = QColor(255, 50, 50)  # 红色文字
-                robot_names = ["R1", "R2", "R3", "R4", "R7"]
-                label = robot_names[class_id - 5]
+                robot_names = ["R1", "R2", "R3", "R4", "R5", "R7"]
+                label = robot_names[class_id - 6]
 
             # 绘制机器人位置
             painter.setBrush(color)

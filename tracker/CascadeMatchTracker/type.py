@@ -1,6 +1,6 @@
 from collections import deque
 from enum import Enum
-from typing import List
+from typing import List, Optional
 import numpy as np
 from dataclasses import dataclass
 from tracker.CascadeMatchTracker.kalman import KalmanFilterBox, KalmanFilter2d
@@ -30,6 +30,10 @@ class SingleDetectionResult:
     time_stamp: float
 
     bot_id: int
+
+    raw_class_name: str = ""
+
+    armor_corners: Optional[List[float]] = None
     
 
 
@@ -45,7 +49,7 @@ MISS_COUNT_THRESHOLD = 10
 
 class BotIdTrack:
     """维护每个trajecotry的追踪状态"""
-    def __init__(self, bot_id: int, class_id: int, class_conf: float):
+    def __init__(self, bot_id: int, class_id: int, class_conf: float, num_classes: int):
         self.class_id_queue = deque([], maxlen=30)
         self.class_conf_queue = deque([], maxlen=30)
         self.class_id_queue.append(class_id)
@@ -53,6 +57,7 @@ class BotIdTrack:
         self.bot_id = bot_id
         self.lost_counter = 0
         self.updated = False
+        self.num_classes = num_classes
     
     def update(self, class_id: int, class_conf: float) -> None:
         self.class_id_queue.append(class_id)
@@ -60,17 +65,16 @@ class BotIdTrack:
         
     def get_class_id_exponent_confidence(self, history_length: int = 10, tau: float = 0.5) -> np.ndarray:
         """
-        获取class_id的指数分布，整合死亡class_id（10-14）到活机器人（0-9），未知class_id（-1）均匀分配。
+        获取 class_id 的指数分布，未知 class_id（-1）均匀分配。
         
         Args:
             history_length: 考虑的历史帧数（默认10）。
             tau: 指数衰减因子（默认0.5）。
         
         Returns:
-            Tuple[np.ndarray, np.ndarray]: 长度10（0-9）的数组，表示活机器人class_id的置信度 and nomralized distribution。
+            Tuple[np.ndarray, np.ndarray]: 长度为 num_classes 的数组。
         """
-        # 初始化置信度数组，仅覆盖活机器人class_id 0-9
-        distribution = np.zeros(10, dtype=np.float32)
+        distribution = np.zeros(self.num_classes, dtype=np.float32)
         
         # 获取最近history_length帧的class_id，限制为队列长度
         valid_length = min(history_length, len(self.class_id_queue), len(self.class_conf_queue))
@@ -83,14 +87,10 @@ class BotIdTrack:
         
         # 统计class_id的加权出现次数
         for i, (class_id, class_conf) in enumerate(zip(list(self.class_id_queue)[-valid_length:], list(self.class_conf_queue)[-valid_length:])):
-            if 0 <= class_id <= 9:  # 活机器人
+            if 0 <= class_id < self.num_classes:
                 distribution[class_id] += weights[i] * class_conf
-            elif 10 <= class_id <= 14:  # 死亡机器人，映射到对应活机器人
-                mapped_id_candidates = [class_id - 5, class_id - 10] 
-                for mapped_id in mapped_id_candidates:
-                    distribution[mapped_id] += weights[i] * 0.8 * class_conf
-            elif class_id == -1:  # 未知class_id，均匀分配到0-9
-                distribution += weights[i] / 10.0 * class_conf
+            elif class_id == -1:
+                distribution += weights[i] / self.num_classes * class_conf
         
         confidence = distribution
         # 归一化分布

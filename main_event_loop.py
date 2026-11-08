@@ -36,19 +36,30 @@ class MainEventLoop:
 
     def __init__(self, camera, referee: RefereeCommManager):
         # print(f"In initializer: {calibrated_R}, {calibrated_T}")
-        self.config = yaml.safe_load(open("config/params.yaml", "r"))
+        with open("config/params.yaml", "r") as file:
+            self.config = yaml.safe_load(file)
         self.camera = camera
         self.camera.register_group("tracker")
         self.referee = referee
         ## Display status
         self.inference_fps = 0
         self.imgsize = self.config["car_detector"]["img_size"]
+        self.detect_vis_img = None
+        self.track_vis_img = None
+        self.tracks = []
+        self.fps_log_interval_sec = float(
+            self.config["debug"].get("fps_log_interval_sec", 1.0)
+        )
+        self.main_loop_sleep_sec = float(
+            self.config["debug"].get("main_loop_sleep_sec", 0.005)
+        )
+        self.last_fps_log_time = time.time()
 
         os.environ["OPENBLAS_FPE"] = "0"
 
-        # 0 - 4 for blue, 5 - 9 for red
+        # 0 - 5 for blue (1,2,3,4,5,7), 6 - 11 for red
         self.divisions_pos = [
-            RefereeDivision2dPosition(-1, -1, False) for _ in range(10)
+            RefereeDivision2dPosition(-1, -1, False) for _ in range(12)
         ]
         
         # Load weight to the cuda during the initialization
@@ -69,7 +80,14 @@ class MainEventLoop:
             raise ValueError(f"Unknown tracker type: {self.config['tracker']['type']}")
         
         # warm up
-        self.tracker.warmup(warmup_num=10)
+        warmup_frames = int(self.config["tracker"].get("warmup_frames", 3))
+        warmup_image_path = self.config["tracker"].get(
+            "warmup_image_path", "tracker/warmup_image.jpg"
+        )
+        self.tracker.warmup(
+            warmup_num=warmup_frames,
+            img_path=warmup_image_path,
+        )
         
         self.__class__._instance = self
 
@@ -145,66 +163,86 @@ class MainEventLoop:
                 if self.divisions_pos[3].is_valid
                 else -8888
             )
-            sentry_x = (
+            standard_5_x = (
                 self.divisions_pos[4].x / 100.0
                 if self.divisions_pos[4].is_valid
                 else -8888
             )
-            sentry_y = (
+            standard_5_y = (
                 self.divisions_pos[4].y / 100.0
                 if self.divisions_pos[4].is_valid
+                else -8888
+            )
+            sentry_x = (
+                self.divisions_pos[5].x / 100.0
+                if self.divisions_pos[5].is_valid
+                else -8888
+            )
+            sentry_y = (
+                self.divisions_pos[5].y / 100.0
+                if self.divisions_pos[5].is_valid
                 else -8888
             )
         else:
             is_blue = True
             hero_x = (
-                self.divisions_pos[5].x / 100.0
-                if self.divisions_pos[5].is_valid
-                else -8888
-            )
-            hero_y = (
-                self.divisions_pos[5].y / 100.0
-                if self.divisions_pos[5].is_valid
-                else -8888
-            )
-            engineer_x = (
                 self.divisions_pos[6].x / 100.0
                 if self.divisions_pos[6].is_valid
                 else -8888
             )
-            engineer_y = (
+            hero_y = (
                 self.divisions_pos[6].y / 100.0
                 if self.divisions_pos[6].is_valid
                 else -8888
             )
-            standard_3_x = (
+            engineer_x = (
                 self.divisions_pos[7].x / 100.0
                 if self.divisions_pos[7].is_valid
                 else -8888
             )
-            standard_3_y = (
+            engineer_y = (
                 self.divisions_pos[7].y / 100.0
                 if self.divisions_pos[7].is_valid
                 else -8888
             )
-            standard_4_x = (
+            standard_3_x = (
                 self.divisions_pos[8].x / 100.0
                 if self.divisions_pos[8].is_valid
                 else -8888
             )
-            standard_4_y = (
+            standard_3_y = (
                 self.divisions_pos[8].y / 100.0
                 if self.divisions_pos[8].is_valid
                 else -8888
             )
-            sentry_x = (
+            standard_4_x = (
                 self.divisions_pos[9].x / 100.0
                 if self.divisions_pos[9].is_valid
                 else -8888
             )
-            sentry_y = (
+            standard_4_y = (
                 self.divisions_pos[9].y / 100.0
                 if self.divisions_pos[9].is_valid
+                else -8888
+            )
+            standard_5_x = (
+                self.divisions_pos[10].x / 100.0
+                if self.divisions_pos[10].is_valid
+                else -8888
+            )
+            standard_5_y = (
+                self.divisions_pos[10].y / 100.0
+                if self.divisions_pos[10].is_valid
+                else -8888
+            )
+            sentry_x = (
+                self.divisions_pos[11].x / 100.0
+                if self.divisions_pos[11].is_valid
+                else -8888
+            )
+            sentry_y = (
+                self.divisions_pos[11].y / 100.0
+                if self.divisions_pos[11].is_valid
                 else -8888
             )
         return Radar2SentryMessage(
@@ -250,42 +288,54 @@ class MainEventLoop:
             standard_4_y = (
                 int(self.divisions_pos[3].y) if self.divisions_pos[3].is_valid else 0
             )
-            sentry_x = (
+            standard_5_x = (
                 int(self.divisions_pos[4].x) if self.divisions_pos[4].is_valid else 0
             )
-            sentry_y = (
+            standard_5_y = (
                 int(self.divisions_pos[4].y) if self.divisions_pos[4].is_valid else 0
+            )
+            sentry_x = (
+                int(self.divisions_pos[5].x) if self.divisions_pos[5].is_valid else 0
+            )
+            sentry_y = (
+                int(self.divisions_pos[5].y) if self.divisions_pos[5].is_valid else 0
             )
         else:
             hero_x = (
-                int(self.divisions_pos[5].x) if self.divisions_pos[5].is_valid else 0
-            )
-            hero_y = (
-                int(self.divisions_pos[5].y) if self.divisions_pos[5].is_valid else 0
-            )
-            engineer_x = (
                 int(self.divisions_pos[6].x) if self.divisions_pos[6].is_valid else 0
             )
-            engineer_y = (
+            hero_y = (
                 int(self.divisions_pos[6].y) if self.divisions_pos[6].is_valid else 0
             )
-            standard_3_x = (
+            engineer_x = (
                 int(self.divisions_pos[7].x) if self.divisions_pos[7].is_valid else 0
             )
-            standard_3_y = (
+            engineer_y = (
                 int(self.divisions_pos[7].y) if self.divisions_pos[7].is_valid else 0
             )
-            standard_4_x = (
+            standard_3_x = (
                 int(self.divisions_pos[8].x) if self.divisions_pos[8].is_valid else 0
             )
-            standard_4_y = (
+            standard_3_y = (
                 int(self.divisions_pos[8].y) if self.divisions_pos[8].is_valid else 0
             )
-            sentry_x = (
+            standard_4_x = (
                 int(self.divisions_pos[9].x) if self.divisions_pos[9].is_valid else 0
             )
-            sentry_y = (
+            standard_4_y = (
                 int(self.divisions_pos[9].y) if self.divisions_pos[9].is_valid else 0
+            )
+            standard_5_x = (
+                int(self.divisions_pos[10].x) if self.divisions_pos[10].is_valid else 0
+            )
+            standard_5_y = (
+                int(self.divisions_pos[10].y) if self.divisions_pos[10].is_valid else 0
+            )
+            sentry_x = (
+                int(self.divisions_pos[11].x) if self.divisions_pos[11].is_valid else 0
+            )
+            sentry_y = (
+                int(self.divisions_pos[11].y) if self.divisions_pos[11].is_valid else 0
             )
         return Radar2ClientMessage(
             hero_x=hero_x,
@@ -296,8 +346,8 @@ class MainEventLoop:
             standard_3_y=standard_3_y,
             standard_4_x=standard_4_x,
             standard_4_y=standard_4_y,
-            standard_5_x=0,  # No standard 5 position
-            standard_5_y=0,  # No standard 5 position
+            standard_5_x=standard_5_x,
+            standard_5_y=standard_5_y,
             sentry_x=sentry_x,
             sentry_y=sentry_y,  # 40
         )
@@ -309,7 +359,7 @@ class MainEventLoop:
         )
         time.sleep(2)  # Allow some time for the tracker to initialize
         while not self.set_event.is_set():
-            time.sleep(0.01)
+            time.sleep(self.main_loop_sleep_sec)
             start = time.time()
             # Update faction
             self.faction = self.referee.get_faction()
@@ -356,4 +406,6 @@ class MainEventLoop:
             finally:
                 end = time.time()
                 self.inference_fps = 1 / (end - start) if end - start > 0 else 0
-                logger.info(f"Inference FPS: {self.inference_fps:.2f}")
+                if end - self.last_fps_log_time >= self.fps_log_interval_sec:
+                    logger.info("Inference FPS: %.2f", self.inference_fps)
+                    self.last_fps_log_time = end

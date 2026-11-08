@@ -20,16 +20,18 @@ class PointGuesser:
         self.cos_factor = config.get('cos_factor', 0.003)  # 默认值为0.003
         self.d_factor = config.get('d_factor', 0.1)       # 默认值为0.01
         self.name_id_convert = {
-            0: 'R1',
-            1: 'R2',
-            2: 'R3',
-            3: 'R4',
-            4: 'R7',
-            5: 'B1',
-            6: 'B2',
-            7: 'B3',
-            8: 'B4',
-            9: 'B7',
+            0: 'B1',
+            1: 'B2',
+            2: 'B3',
+            3: 'B4',
+            4: 'B5',
+            5: 'B7',
+            6: 'R1',
+            7: 'R2',
+            8: 'R3',
+            9: 'R4',
+            10: 'R5',
+            11: 'R7',
         }
 
     def load_guess_points(self, config_path=None):
